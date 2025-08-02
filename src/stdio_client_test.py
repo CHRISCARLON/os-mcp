@@ -8,13 +8,6 @@ from mcp.client.stdio import stdio_client
 from mcp.client.stdio import StdioServerParameters
 from mcp.types import TextContent
 
-TEST_BANNER = """
-STDIO RATE LIMIT TEST
-=====================
-Testing 1 req/min
-=====================
-"""
-
 
 def extract_text_from_result(result) -> str:
     """Safely extract text from MCP tool result"""
@@ -31,8 +24,6 @@ def extract_text_from_result(result) -> str:
 
 async def test_stdio_rate_limiting():
     """Test STDIO rate limiting - should block after 1 request per minute"""
-
-    print(TEST_BANNER)
     env = os.environ.copy()
     env["STDIO_KEY"] = "test-stdio-key"
     env["OS_API_KEY"] = os.environ.get("OS_API_KEY", "dummy-key-for-testing")

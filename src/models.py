@@ -42,15 +42,22 @@ class NGDAPIEndpoint(Enum):
     )
 
     # Places API Endpoints
+    # TODO: Add these back in when I get access to the Places API from OS
     # PLACES_BASE_PATH = "https://api.os.uk/search/places/v1/{}"
     # PLACES_UPRN = PLACES_BASE_PATH.format("uprn")
     # POST_CODE = PLACES_BASE_PATH.format("postcode")
 
 
 class OpenAPISpecification(BaseModel):
-    """OpenAPI specification for the OS NGD API"""
+    """Parsed OpenAPI specification optimized for LLM context"""
 
-    spec: dict[str, Any]
+    title: str
+    version: str
+    base_url: str
+    endpoints: Dict[str, str]
+    collection_ids: List[str]
+    supported_crs: Dict[str, Any]
+    crs_guide: Dict[str, str]
 
 
 class WorkflowStep(BaseModel):
@@ -88,3 +95,24 @@ class CollectionsCache(BaseModel):
 
     collections: List[Collection]
     raw_response: Dict[str, Any]
+
+
+class CollectionQueryables(BaseModel):
+    """Queryables information for a collection"""
+
+    id: str
+    title: str
+    description: str
+    all_queryables: Dict[str, Any]
+    enum_queryables: Dict[str, Any]
+    has_enum_filters: bool
+    total_queryables: int
+    enum_count: int
+
+
+class WorkflowContextCache(BaseModel):
+    """Cached workflow context data"""
+
+    collections_info: Dict[str, CollectionQueryables]
+    openapi_spec: OpenAPISpecification
+    cached_at: float

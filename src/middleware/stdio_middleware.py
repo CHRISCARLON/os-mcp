@@ -13,7 +13,7 @@ F = TypeVar("F", bound=Callable[..., Any])
 class StdioRateLimiter:
     """STDIO-specific rate limiting"""
 
-    def __init__(self, requests_per_minute: int = 20, window_seconds: int = 60):
+    def __init__(self, requests_per_minute: int = 10, window_seconds: int = 60):
         self.requests_per_minute = requests_per_minute
         self.window_seconds = window_seconds
         self.request_timestamps = deque()

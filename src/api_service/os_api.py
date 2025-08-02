@@ -2,15 +2,25 @@ import os
 import aiohttp
 import asyncio
 import re
+import time
+import concurrent.futures
+import threading
+
 from typing import Dict, List, Any, Optional
-from models import NGDAPIEndpoint, OpenAPISpecification, Collection, CollectionsCache
-from .protocols import APIClient
+from models import (
+    NGDAPIEndpoint,
+    OpenAPISpecification,
+    Collection,
+    CollectionsCache,
+    CollectionQueryables,
+    WorkflowContextCache,
+)
+from api_service.protocols import APIClient
 from utils.logging_config import get_logger
 
 logger = get_logger(__name__)
 
 
-# TODO: We should add in the workflow context processing in here
 class OSAPIClient(APIClient):
     """Implementation an OS API client"""
 
@@ -30,143 +40,9 @@ class OSAPIClient(APIClient):
         self.request_delay = 0.7
         self._cached_openapi_spec: Optional[OpenAPISpecification] = None
         self._cached_collections: Optional[CollectionsCache] = None
+        self._cached_workflow_context: Optional[WorkflowContextCache] = None
 
-    async def _get_open_api_spec(self) -> OpenAPISpecification:
-        """Get the OpenAPI spec for the OS NGD API"""
-        try:
-            response = await self.make_request("OPENAPI_SPEC", params={"f": "json"})
-            spec = OpenAPISpecification(spec=response)
-            return spec
-        except Exception as e:
-            raise ValueError(f"Failed to get OpenAPI spec: {e}")
-
-    async def cache_openapi_spec(self) -> OpenAPISpecification:
-        """
-        Cache the OpenAPI spec.
-
-        Returns:
-            The cached OpenAPI spec
-        """
-        if self._cached_openapi_spec is None:
-            logger.debug("Caching OpenAPI spec for LLM context...")
-            try:
-                self._cached_openapi_spec = await self._get_open_api_spec()
-                logger.debug("OpenAPI spec successfully cached")
-            except Exception as e:
-                raise ValueError(f"Failed to cache OpenAPI spec: {e}")
-        return self._cached_openapi_spec
-
-    def _filter_latest_collections(
-        self, collections: List[Dict[str, Any]]
-    ) -> List[Collection]:
-        """
-        Filter collections to keep only the latest version of each collection type.
-        For collections with IDs like 'trn-ntwk-roadlink-1', 'trn-ntwk-roadlink-2', 'trn-ntwk-roadlink-3',
-        only keep the one with the highest number.
-
-        Args:
-            collections: Raw collections from API
-
-        Returns:
-            Filtered list of Collection objects
-        """
-        latest_versions: Dict[str, Dict[str, Any]] = {}
-
-        for col in collections:
-            col_id = col.get("id", "")
-
-            match = re.match(r"^(.+?)-(\d+)$", col_id)
-
-            if match:
-                base_name = match.group(1)
-                version_num = int(match.group(2))
-
-                if (
-                    base_name not in latest_versions
-                    or version_num > latest_versions[base_name]["version"]
-                ):
-                    latest_versions[base_name] = {"version": version_num, "data": col}
-            else:
-                latest_versions[col_id] = {"version": 0, "data": col}
-
-        filtered_collections = []
-        for item in latest_versions.values():
-            col_data = item["data"]
-            filtered_collections.append(
-                Collection(
-                    id=col_data.get("id", ""),
-                    title=col_data.get("title", ""),
-                    description=col_data.get("description", ""),
-                    links=col_data.get("links", []),
-                    extent=col_data.get("extent", {}),
-                    itemType=col_data.get("itemType", "feature"),
-                )
-            )
-
-        return filtered_collections
-
-    async def _get_collections(self) -> CollectionsCache:
-        """Get all collections from the OS NGD API"""
-        try:
-            response = await self.make_request("COLLECTIONS")
-            collections_list = response.get("collections", [])
-            filtered = self._filter_latest_collections(collections_list)
-            logger.debug(
-                f"Filtered collections: {len(filtered)} collections"
-            )  # Don't log the actual data
-            return CollectionsCache(collections=filtered, raw_response=response)
-        except Exception as e:
-            sanitized_error = self._sanitise_api_key(str(e))
-            logger.error(f"Error getting collections: {sanitized_error}")
-            raise ValueError(f"Failed to get collections: {sanitized_error}")
-
-    async def cache_collections(self) -> CollectionsCache:
-        """
-        Cache the collections data with filtering applied.
-
-        Returns:
-            The cached collections
-        """
-        if self._cached_collections is None:
-            logger.debug("Caching collections for LLM context...")
-            try:
-                self._cached_collections = await self._get_collections()
-                logger.debug(
-                    f"Collections successfully cached - {len(self._cached_collections.collections)} collections after filtering"
-                )
-            except Exception as e:
-                sanitized_error = self._sanitise_api_key(str(e))
-                raise ValueError(f"Failed to cache collections: {sanitized_error}")
-        return self._cached_collections
-
-    async def initialise(self):
-        """Initialise the aiohttp session if not already created"""
-        if self.session is None:
-            self.session = aiohttp.ClientSession(
-                connector=aiohttp.TCPConnector(
-                    force_close=True,
-                    limit=1,  # TODO: Strict limit to only 1 connection - may need to revisit this
-                )
-            )
-
-    async def close(self):
-        """Close the session when done"""
-        if self.session:
-            await self.session.close()
-            self.session = None
-            self._cached_openapi_spec = None
-            self._cached_collections = None
-
-    async def get_api_key(self) -> str:
-        """Get the OS API key from environment variable or init param."""
-        if self.api_key:
-            return self.api_key
-
-        api_key = os.environ.get("OS_API_KEY")
-        if not api_key:
-            raise ValueError("OS_API_KEY environment variable is not set")
-        return api_key
-
+    # Private helper methods
     def _sanitise_api_key(self, text: Any) -> str:
         """Remove API keys from any text (URLs, error messages, etc.)"""
         if not isinstance(text, str):
@@ -221,6 +97,480 @@ class OSAPIClient(APIClient):
                 return self._sanitise_api_key(data)
 
         return data
+
+    def _filter_latest_collections(
+        self, collections: List[Dict[str, Any]]
+    ) -> List[Collection]:
+        """
+        Filter collections to keep only the latest version of each collection type.
+        For collections with IDs like 'trn-ntwk-roadlink-1', 'trn-ntwk-roadlink-2', 'trn-ntwk-roadlink-3',
+        only keep the one with the highest number.
+
+        Args:
+            collections: Raw collections from API
+
+        Returns:
+            Filtered list of Collection objects
+        """
+        latest_versions: Dict[str, Dict[str, Any]] = {}
+
+        for col in collections:
+            col_id = col.get("id", "")
+
+            match = re.match(r"^(.+?)-(\d+)$", col_id)
+
+            if match:
+                base_name = match.group(1)
+                version_num = int(match.group(2))
+
+                if (
+                    base_name not in latest_versions
+                    or version_num > latest_versions[base_name]["version"]
+                ):
+                    latest_versions[base_name] = {"version": version_num, "data": col}
+            else:
+                latest_versions[col_id] = {"version": 0, "data": col}
+
+        filtered_collections = []
+        for item in latest_versions.values():
+            col_data = item["data"]
+            filtered_collections.append(
+                Collection(
+                    id=col_data.get("id", ""),
+                    title=col_data.get("title", ""),
+                    description=col_data.get("description", ""),
+                    links=col_data.get("links", []),
+                    extent=col_data.get("extent", {}),
+                    itemType=col_data.get("itemType", "feature"),
+                )
+            )
+
+        return filtered_collections
+
+    def _parse_openapi_spec_for_llm(
+        self, spec_data: dict, collection_ids: List[str]
+    ) -> dict:
+        """Parse OpenAPI spec to extract only essential information for LLM context"""
+        supported_crs = {
+            "input": [],
+            "output": [],
+            "default": "http://www.opengis.net/def/crs/OGC/1.3/CRS84",
+        }
+
+        parsed = {
+            "title": spec_data.get("info", {}).get("title", ""),
+            "version": spec_data.get("info", {}).get("version", ""),
+            "base_url": spec_data.get("servers", [{}])[0].get("url", ""),
+            "endpoints": {},
+            "collection_ids": collection_ids,
+            "supported_crs": supported_crs,
+        }
+
+        paths = spec_data.get("paths", {})
+        for path, methods in paths.items():
+            for method, details in methods.items():
+                if method == "get" and "parameters" in details:
+                    for param in details["parameters"]:
+                        param_name = param.get("name", "")
+
+                        if param_name == "collectionId" and "schema" in param:
+                            enum_values = param["schema"].get("enum", [])
+                            if enum_values:
+                                parsed["collection_ids"] = enum_values
+
+                        elif (
+                            param_name in ["bbox-crs", "filter-crs"]
+                            and "schema" in param
+                        ):
+                            crs_values = param["schema"].get("enum", [])
+                            if crs_values and not supported_crs["input"]:
+                                supported_crs["input"] = crs_values
+
+                        elif param_name == "crs" and "schema" in param:
+                            crs_values = param["schema"].get("enum", [])
+                            if crs_values and not supported_crs["output"]:
+                                supported_crs["output"] = crs_values
+
+        endpoint_patterns = {
+            "/collections": "List all collections",
+            "/collections/{collectionId}": "Get collection info",
+            "/collections/{collectionId}/schema": "Get collection schema",
+            "/collections/{collectionId}/queryables": "Get collection queryables",
+            "/collections/{collectionId}/items": "Search features in collection",
+            "/collections/{collectionId}/items/{featureId}": "Get specific feature",
+        }
+        parsed["endpoints"] = endpoint_patterns
+        parsed["crs_guide"] = {
+            "WGS84": "http://www.opengis.net/def/crs/OGC/1.3/CRS84 (default, longitude/latitude)",
+            "British_National_Grid": "http://www.opengis.net/def/crs/EPSG/0/27700 (UK Ordnance Survey)",
+            "WGS84_latlon": "http://www.opengis.net/def/crs/EPSG/0/4326 (latitude/longitude)",
+            "Web_Mercator": "http://www.opengis.net/def/crs/EPSG/0/3857 (Web mapping)",
+        }
+
+        return parsed
+
+    # Private async methods
+    async def _get_open_api_spec(self) -> OpenAPISpecification:
+        """Get the OpenAPI spec for the OS NGD API"""
+        try:
+            response = await self.make_request("OPENAPI_SPEC", params={"f": "json"})
+
+            # Sanitize the raw response before processing
+            sanitized_response = self._sanitise_response(response)
+
+            collections_cache = await self.cache_collections()
+            filtered_collection_ids = [col.id for col in collections_cache.collections]
+
+            parsed_spec = self._parse_openapi_spec_for_llm(
+                sanitized_response, filtered_collection_ids
+            )
+
+            spec = OpenAPISpecification(
+                title=parsed_spec["title"],
+                version=parsed_spec["version"],
+                base_url=parsed_spec["base_url"],
+                endpoints=parsed_spec["endpoints"],
+                collection_ids=filtered_collection_ids,
+                supported_crs=parsed_spec["supported_crs"],
+                crs_guide=parsed_spec["crs_guide"],
+            )
+            return spec
+        except Exception as e:
+            raise ValueError(f"Failed to get OpenAPI spec: {e}")
+
+    async def cache_openapi_spec(self) -> OpenAPISpecification:
+        """
+        Cache the OpenAPI spec.
+
+        Returns:
+            The cached OpenAPI spec
+        """
+        if self._cached_openapi_spec is None:
+            logger.debug("Caching OpenAPI spec for LLM context...")
+            try:
+                self._cached_openapi_spec = await self._get_open_api_spec()
+                logger.debug("OpenAPI spec successfully cached")
+            except Exception as e:
+                raise ValueError(f"Failed to cache OpenAPI spec: {e}")
+        return self._cached_openapi_spec
+
+    async def _get_collections(self) -> CollectionsCache:
+        """Get all collections from the OS NGD API"""
+        try:
+            response = await self.make_request("COLLECTIONS")
+            collections_list = response.get("collections", [])
+            filtered = self._filter_latest_collections(collections_list)
+            logger.debug(f"Filtered collections: {len(filtered)} collections")
+            return CollectionsCache(collections=filtered, raw_response=response)
+        except Exception as e:
+            sanitized_error = self._sanitise_api_key(str(e))
+            logger.error(f"Error getting collections: {sanitized_error}")
+            raise ValueError(f"Failed to get collections: {sanitized_error}")
+
+    async def cache_collections(self) -> CollectionsCache:
+        """
+        Cache the collections data with filtering applied.
+
+        Returns:
+            The cached collections
+        """
+        if self._cached_collections is None:
+            logger.debug("Caching collections for LLM context...")
+            try:
+                self._cached_collections = await self._get_collections()
+                logger.debug(
+                    f"Collections successfully cached - {len(self._cached_collections.collections)} collections after filtering"
+                )
+            except Exception as e:
+                sanitized_error = self._sanitise_api_key(str(e))
+                raise ValueError(f"Failed to cache collections: {sanitized_error}")
+        return self._cached_collections
+
+    async def _build_workflow_context(self) -> WorkflowContextCache:
+        """Build the complete workflow context with all collections and queryables"""
+        openapi_spec = await self.cache_openapi_spec()
+        collections_cache = await self.cache_collections()
+
+        collections_info = {}
+        if collections_cache and hasattr(collections_cache, "collections"):
+            collections_list = getattr(collections_cache, "collections", [])
+
+            if collections_list:
+                logger.debug(
+                    f"Fetching raw queryables for {len(collections_list)} collections..."
+                )
+                tasks = [
+                    self.make_request(
+                        "COLLECTION_QUERYABLES", path_params=[collection.id]
+                    )
+                    for collection in collections_list
+                ]
+                raw_queryables = await asyncio.gather(*tasks, return_exceptions=True)
+
+                logger.debug(
+                    f"Processing {len(raw_queryables)} queryables in thread pool..."
+                )
+
+                def process_queryables_data(collection_and_data):
+                    collection, queryables_data = collection_and_data
+                    logger.debug(
+                        f"Processing collection {collection.id} in thread {threading.current_thread().name}"
+                    )
+
+                    if isinstance(queryables_data, Exception):
+                        logger.warning(
+                            f"Failed to fetch queryables for {collection.id}: {queryables_data}"
+                        )
+                        return (
+                            collection.id,
+                            CollectionQueryables(
+                                id=collection.id,
+                                title=collection.title,
+                                description=collection.description,
+                                all_queryables={},
+                                enum_queryables={},
+                                has_enum_filters=False,
+                                total_queryables=0,
+                                enum_count=0,
+                            ),
+                        )
+
+                    all_queryables = {}
+                    enum_queryables = {}
+                    properties = queryables_data.get("properties", {})
+
+                    for prop_name, prop_details in properties.items():
+                        prop_type = prop_details.get("type", ["string"])
+                        if isinstance(prop_type, list):
+                            main_type = prop_type[0] if prop_type else "string"
+                            is_nullable = "null" in prop_type
+                        else:
+                            main_type = prop_type
+                            is_nullable = False
+
+                        all_queryables[prop_name] = {
+                            "type": main_type,
+                            "nullable": is_nullable,
+                            "max_length": prop_details.get("maxLength"),
+                            "format": prop_details.get("format"),
+                            "pattern": prop_details.get("pattern"),
+                            "minimum": prop_details.get("minimum"),
+                            "maximum": prop_details.get("maximum"),
+                            "is_enum": prop_details.get("enumeration", False),
+                        }
+
+                        if prop_details.get("enumeration") and "enum" in prop_details:
+                            enum_queryables[prop_name] = {
+                                "values": prop_details["enum"],
+                                "type": main_type,
+                                "nullable": is_nullable,
+                                "max_length": prop_details.get("maxLength"),
+                            }
+                            all_queryables[prop_name]["enum_values"] = prop_details[
+                                "enum"
+                            ]
+
+                        all_queryables[prop_name] = {
+                            k: v
+                            for k, v in all_queryables[prop_name].items()
+                            if v is not None
+                        }
+
+                    return (
+                        collection.id,
+                        CollectionQueryables(
+                            id=collection.id,
+                            title=collection.title,
+                            description=collection.description,
+                            all_queryables=all_queryables,
+                            enum_queryables=enum_queryables,
+                            has_enum_filters=len(enum_queryables) > 0,
+                            total_queryables=len(all_queryables),
+                            enum_count=len(enum_queryables),
+                        ),
+                    )
+
+                thread_start = time.time()
+                with concurrent.futures.ThreadPoolExecutor(max_workers=4) as executor:
+                    collection_data_pairs = list(zip(collections_list, raw_queryables))
+                    processed = await asyncio.get_event_loop().run_in_executor(
+                        executor,
+                        lambda: list(
+                            map(process_queryables_data, collection_data_pairs)
+                        ),
+                    )
+                thread_end = time.time()
+                logger.debug(
+                    f"Thread pool processing completed in {thread_end - thread_start:.4f}s"
+                )
+
+                collections_info = dict(processed)
+
+        return WorkflowContextCache(
+            collections_info=collections_info,
+            openapi_spec=openapi_spec,
+            cached_at=time.time(),
+        )
+
+    async def cache_workflow_context(self) -> WorkflowContextCache:
+        """
+        Cache the complete workflow context including collections and queryables.
+
+        Returns:
+            The cached workflow context
+        """
+        if self._cached_workflow_context is None:
+            logger.debug("Caching workflow context for LLM...")
+            try:
+                self._cached_workflow_context = await self._build_workflow_context()
+                logger.debug(
+                    f"Workflow context successfully cached - {len(self._cached_workflow_context.collections_info)} collections processed"
+                )
+            except Exception as e:
+                sanitized_error = self._sanitise_api_key(str(e))
+                raise ValueError(f"Failed to cache workflow context: {sanitized_error}")
+        return self._cached_workflow_context
+
+    async def fetch_collections_queryables(
+        self, collection_ids: List[str]
+    ) -> Dict[str, CollectionQueryables]:
+        """Fetch detailed queryables for specific collections only"""
+        if not collection_ids:
+            return {}
+
+        logger.debug(f"Fetching queryables for specific collections: {collection_ids}")
+
+        collections_cache = await self.cache_collections()
+        collections_map = {coll.id: coll for coll in collections_cache.collections}
+
+        tasks = [
+            self.make_request("COLLECTION_QUERYABLES", path_params=[collection_id])
+            for collection_id in collection_ids
+            if collection_id in collections_map
+        ]
+
+        if not tasks:
+            return {}
+
+        raw_queryables = await asyncio.gather(*tasks, return_exceptions=True)
+
+        def process_single_collection_queryables(collection_id, queryables_data):
+            collection = collections_map[collection_id]
+            logger.debug(
+                f"Processing collection {collection.id} in thread {threading.current_thread().name}"
+            )
+
+            if isinstance(queryables_data, Exception):
+                logger.warning(
+                    f"Failed to fetch queryables for {collection.id}: {queryables_data}"
+                )
+                return (
+                    collection.id,
+                    CollectionQueryables(
+                        id=collection.id,
+                        title=collection.title,
+                        description=collection.description,
+                        all_queryables={},
+                        enum_queryables={},
+                        has_enum_filters=False,
+                        total_queryables=0,
+                        enum_count=0,
+                    ),
+                )
+
+            all_queryables = {}
+            enum_queryables = {}
+            properties = queryables_data.get("properties", {})
+
+            for prop_name, prop_details in properties.items():
+                prop_type = prop_details.get("type", ["string"])
+                if isinstance(prop_type, list):
+                    main_type = prop_type[0] if prop_type else "string"
+                    is_nullable = "null" in prop_type
+                else:
+                    main_type = prop_type
+                    is_nullable = False
+
+                all_queryables[prop_name] = {
+                    "type": main_type,
+                    "nullable": is_nullable,
+                    "max_length": prop_details.get("maxLength"),
+                    "format": prop_details.get("format"),
+                    "pattern": prop_details.get("pattern"),
+                    "minimum": prop_details.get("minimum"),
+                    "maximum": prop_details.get("maximum"),
+                    "is_enum": prop_details.get("enumeration", False),
+                }
+
+                if prop_details.get("enumeration") and "enum" in prop_details:
+                    enum_queryables[prop_name] = {
+                        "values": prop_details["enum"],
+                        "type": main_type,
+                        "nullable": is_nullable,
+                        "max_length": prop_details.get("maxLength"),
+                    }
+                    all_queryables[prop_name]["enum_values"] = prop_details["enum"]
+
+                all_queryables[prop_name] = {
+                    k: v for k, v in all_queryables[prop_name].items() if v is not None
+                }
+
+            return (
+                collection.id,
+                CollectionQueryables(
+                    id=collection.id,
+                    title=collection.title,
+                    description=collection.description,
+                    all_queryables=all_queryables,
+                    enum_queryables=enum_queryables,
+                    has_enum_filters=len(enum_queryables) > 0,
+                    total_queryables=len(all_queryables),
+                    enum_count=len(enum_queryables),
+                ),
+            )
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=4) as executor:
+            collection_data_pairs = list(zip(collection_ids, raw_queryables))
+            processed = await asyncio.get_event_loop().run_in_executor(
+                executor,
+                lambda: [
+                    process_single_collection_queryables(coll_id, data)
+                    for coll_id, data in collection_data_pairs
+                    if coll_id in collections_map
+                ],
+            )
+
+        return {coll_id: queryables for coll_id, queryables in processed}
+
+    # Public async methods
+    async def initialise(self):
+        """Initialise the aiohttp session if not already created"""
+        if self.session is None:
+            self.session = aiohttp.ClientSession(
+                connector=aiohttp.TCPConnector(
+                    force_close=True,
+                    limit=1,  # TODO: Strict limit to only 1 connection - may need to revisit this
+                )
+            )
+
+    async def close(self):
+        """Close the session when done"""
+        if self.session:
+            await self.session.close()
+            self.session = None
+            self._cached_openapi_spec = None
+            self._cached_collections = None
+            self._cached_workflow_context = None
+
+    async def get_api_key(self) -> str:
+        """Get the OS API key from environment variable or init param."""
+        if self.api_key:
+            return self.api_key
+
+        api_key = os.environ.get("OS_API_KEY")
+        if not api_key:
+            raise ValueError("OS_API_KEY environment variable is not set")
+        return api_key
 
     async def make_request(
         self,

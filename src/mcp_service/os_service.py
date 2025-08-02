@@ -1,9 +1,7 @@
 import json
 import asyncio
 import functools
-import concurrent.futures
-import time
-import threading
+import re
 
 from typing import Optional, List, Dict, Any, Union
 from api_service.protocols import APIClient
@@ -12,7 +10,6 @@ from mcp_service.protocols import MCPService, FeatureService
 from mcp_service.guardrails import ToolGuardrails
 from workflow_generator.workflow_planner import WorkflowPlanner
 from utils.logging_config import get_logger
-from models import Collection
 from mcp_service.resources import OSDocumentationResources
 from mcp_service.prompts import OSWorkflowPrompts
 
@@ -42,6 +39,7 @@ class OSDataHubService(FeatureService):
         self.register_resources()
         self.register_prompts()
 
+    # Register all the resources, tools, and prompts
     def register_resources(self) -> None:
         """Register all MCP resources"""
         doc_resources = OSDocumentationResources(self.mcp, self.api_client)
@@ -64,11 +62,11 @@ class OSDataHubService(FeatureService):
         self.hello_world = self.mcp.tool()(apply_middleware(self.hello_world))
         self.check_api_key = self.mcp.tool()(apply_middleware(self.check_api_key))
         self.list_collections = self.mcp.tool()(apply_middleware(self.list_collections))
-        self.get_collection_info = self.mcp.tool()(
-            apply_middleware(self.get_collection_info)
+        self.get_single_collection = self.mcp.tool()(
+            apply_middleware(self.get_single_collection)
         )
-        self.get_collection_queryables = self.mcp.tool()(
-            apply_middleware(self.get_collection_queryables)
+        self.get_single_collection_queryables = self.mcp.tool()(
+            apply_middleware(self.get_single_collection_queryables)
         )
         self.search_features = self.mcp.tool()(apply_middleware(self.search_features))
         self.get_feature = self.mcp.tool()(apply_middleware(self.get_feature))
@@ -84,12 +82,16 @@ class OSDataHubService(FeatureService):
         self.get_prompt_templates = self.mcp.tool()(
             apply_middleware(self.get_prompt_templates)
         )
+        self.fetch_detailed_collections = self.mcp.tool()(
+            apply_middleware(self.fetch_detailed_collections)
+        )
 
     def register_prompts(self) -> None:
         """Register all MCP prompts"""
         workflow_prompts = OSWorkflowPrompts(self.mcp)
         workflow_prompts.register_all()
 
+    # Run the MCP service
     def run(self) -> None:
         """Run the MCP service"""
         try:
@@ -113,189 +115,74 @@ class OSDataHubService(FeatureService):
         except Exception as e:
             logger.error(f"Error closing API client: {e}")
 
-    # TODO: All this processing should really be done outside of the os mcp service level - and we need to cache the results
+    # Get the workflow context from the cached API client data
+    # TODO: Lots of work to do here to reduce the size of the context and make it more readable for the LLM but not sacrificing the information
     async def get_workflow_context(self) -> str:
-        """Get workflow context and initialise planner if needed"""
+        """Get basic workflow context - no detailed queryables yet"""
         try:
             if self.workflow_planner is None:
-                cached_spec = await self.api_client.cache_openapi_spec()
-                cached_collections = await self.api_client.cache_collections()
+                collections_cache = await self.api_client.cache_collections()
+                basic_collections_info = {
+                    coll.id: {
+                        "id": coll.id,
+                        "title": coll.title,
+                        "description": coll.description,
+                        # No queryables here - will be fetched on-demand
+                    }
+                    for coll in collections_cache.collections
+                }
 
-                collections_info = {}
-                if cached_collections and hasattr(cached_collections, "collections"):
-                    collections_list: List[Collection] = getattr(
-                        cached_collections, "collections", []
-                    )
-                    if collections_list and hasattr(collections_list, "__iter__"):
+                self.workflow_planner = WorkflowPlanner(
+                    await self.api_client.cache_openapi_spec(), basic_collections_info
+                )
 
-                        async def fetch_collection_queryables(
-                            collection: Collection,
-                        ) -> Dict[str, Any]:
-                            try:
-                                queryables_data = await self.api_client.make_request(
-                                    "COLLECTION_QUERYABLES", path_params=[collection.id]
-                                )
-
-                                all_queryables = {}
-                                enum_queryables = {}
-                                properties = queryables_data.get("properties", {})
-
-                                for prop_name, prop_details in properties.items():
-                                    prop_type = prop_details.get("type", ["string"])
-                                    if isinstance(prop_type, list):
-                                        main_type = (
-                                            prop_type[0] if prop_type else "string"
-                                        )
-                                        is_nullable = "null" in prop_type
-                                    else:
-                                        main_type = prop_type
-                                        is_nullable = False
-
-                                    all_queryables[prop_name] = {
-                                        "type": main_type,
-                                        "nullable": is_nullable,
-                                        "description": prop_details.get(
-                                            "description", ""
-                                        ),
-                                        "max_length": prop_details.get("maxLength"),
-                                        "format": prop_details.get("format"),
-                                        "pattern": prop_details.get("pattern"),
-                                        "minimum": prop_details.get("minimum"),
-                                        "maximum": prop_details.get("maximum"),
-                                        "is_enum": prop_details.get(
-                                            "enumeration", False
-                                        ),
-                                    }
-
-                                    if (
-                                        prop_details.get("enumeration")
-                                        and "enum" in prop_details
-                                    ):
-                                        enum_queryables[prop_name] = {
-                                            "values": prop_details["enum"],
-                                            "type": main_type,
-                                            "nullable": is_nullable,
-                                            "description": prop_details.get(
-                                                "description", ""
-                                            ),
-                                            "max_length": prop_details.get("maxLength"),
-                                        }
-                                        all_queryables[prop_name]["enum_values"] = (
-                                            prop_details["enum"]
-                                        )
-
-                                    all_queryables[prop_name] = {
-                                        k: v
-                                        for k, v in all_queryables[prop_name].items()
-                                        if v is not None
-                                    }
-
-                                return {
-                                    "collection": collection,
-                                    "all_queryables": all_queryables,
-                                    "enum_queryables": enum_queryables,
-                                }
-
-                            except Exception as e:
-                                logger.warning(
-                                    f"Failed to fetch queryables for {collection.id}: {e}"
-                                )
-                                return {
-                                    "collection": collection,
-                                    "all_queryables": {},
-                                    "enum_queryables": {},
-                                }
-
-                        # This should reduce the network io bottleneck and speed it up!
-                        tasks = [
-                            fetch_collection_queryables(collection)
-                            for collection in collections_list
-                        ]
-                        queryables_results = await asyncio.gather(*tasks)
-
-                        logger.debug(
-                            f"Starting thread pool processing for {len(queryables_results)} results..."
-                        )
-
-                        def process_collection_result(result):
-                            collection = result["collection"]
-                            logger.debug(
-                                f"Processing collection {collection.id} in thread {threading.current_thread().name}"
-                            )
-                            all_queryables = result["all_queryables"]
-                            enum_queryables = result["enum_queryables"]
-
-                            return (
-                                collection.id,
-                                {
-                                    "id": collection.id,
-                                    "title": collection.title,
-                                    "description": collection.description,
-                                    "all_queryables": all_queryables,
-                                    "enum_queryables": enum_queryables,
-                                    "has_enum_filters": len(enum_queryables) > 0,
-                                    "total_queryables": len(all_queryables),
-                                    "enum_count": len(enum_queryables),
-                                },
-                            )
-
-                        thread_start = time.time()
-
-                        # This should reduce the work required to process the queryables results
-                        # TODO: need to check this really does speed it up
-                        with concurrent.futures.ThreadPoolExecutor(
-                            max_workers=4
-                        ) as executor:
-                            logger.debug(
-                                f"Thread pool created with {executor._max_workers} workers"
-                            )
-                            processed = await asyncio.get_event_loop().run_in_executor(
-                                executor,
-                                lambda: list(
-                                    map(process_collection_result, queryables_results)
-                                ),
-                            )
-
-                        thread_end = time.time()
-                        logger.debug(
-                            f"Thread pool processing completed in {thread_end - thread_start:.4f}s"
-                        )
-
-                        collections_info = dict(processed)
-
-                self.workflow_planner = WorkflowPlanner(cached_spec, collections_info)
-
-            context = self.workflow_planner.get_context()
+            context = self.workflow_planner.get_basic_context()
             return json.dumps(
                 {
+                    "CRITICAL_COLLECTION_LIST": sorted(
+                        context["available_collections"].keys()
+                    ),
                     "MANDATORY_PLANNING_REQUIREMENT": {
-                        "CRITICAL": "You MUST explain your complete plan to the user BEFORE making any tool calls",
+                        "CRITICAL": "You MUST follow the 2-step planning process:",
+                        "step_1": "Explain your complete plan listing which specific collections you will use and why",
+                        "step_2": "Call fetch_detailed_collections('collection-id-1,collection-id-2') to get queryables for those collections BEFORE making search calls",
                         "required_explanation": {
-                            "1": "Which collection you will use and why",
-                            "2": "What specific filters you will apply (show the exact filter string)",
-                            "3": "What steps you will take",
+                            "1": "Which collections you will use and why",
+                            "2": "What you expect to find in those collections",
+                            "3": "What your search strategy will be",
                         },
-                        "workflow_enforcement": "Do not proceed with tool calls until you have clearly explained your plan to the user",
-                        "example_planning": "I will search the 'lus-fts-site-1' collection using the filter 'oslandusetertiarygroup = \"Cinema\"' to find all cinema locations in your specified area.",
+                        "workflow_enforcement": "Do not proceed with search_features until you have fetched detailed queryables",
+                        "example_planning": "I will use 'lus-fts-site-1' for finding cinemas. Let me fetch its detailed queryables first...",
                     },
-                    "available_collections": context["available_collections"],
-                    "openapi_endpoints": context["openapi_endpoints"],
+                    "available_collections": context[
+                        "available_collections"
+                    ],  # Basic info only - no queryables yet - this is to reduce the size of the context for the LLM
+                    "openapi_spec": context["openapi_spec"].model_dump()
+                    if context["openapi_spec"]
+                    else None,
+                    "TWO_STEP_WORKFLOW": {
+                        "step_1": "Plan with basic collection info (no detailed queryables available yet)",
+                        "step_2": "Use fetch_detailed_collections() to get queryables for your chosen collections",
+                        "step_3": "Execute search_features with proper filters using the fetched queryables",
+                    },
+                    "AVAILABLE_TOOLS": {
+                        "fetch_detailed_collections": "Get detailed queryables for specific collections: fetch_detailed_collections('lus-fts-site-1,trn-ntwk-street-1')",
+                        "search_features": "Search features (requires detailed queryables first)",
+                    },
                     "QUICK_FILTERING_GUIDE": {
                         "primary_tool": "search_features",
                         "key_parameter": "filter",
-                        "enum_fields": "Use exact values from collection's enum_queryables (e.g., 'Cinema', 'A Road')",
+                        "enum_fields": "Use exact values from collection's enum_queryables (fetch these first!)",
                         "simple_fields": "Use direct values (e.g., usrn = 12345678)",
                     },
                     "COMMON_EXAMPLES": {
-                        "cinema_search": "search_features(collection_id='lus-fts-site-1', bbox='...', filter=\"oslandusetertiarygroup = 'Cinema'\")",
-                        "a_road_search": "search_features(collection_id='trn-ntwk-street-1', bbox='...', filter=\"roadclassification = 'A Road'\")",
-                        "usrn_search": "search_features(collection_id='trn-ntwk-street-1', filter='usrn = 12345678')",
-                        "street_name": "search_features(collection_id='trn-ntwk-street-1', filter=\"designatedname1_text LIKE '%high%'\")",
+                        "workflow_example": "1) Explain plan → 2) fetch_detailed_collections('lus-fts-site-1') → 3) search_features with proper filter",
+                        "cinema_search": "After fetching queryables: search_features(collection_id='lus-fts-site-1', filter=\"oslandusetertiarygroup = 'Cinema'\")",
                     },
                     "CRITICAL_RULES": {
                         "1": "ALWAYS explain your plan first",
-                        "2": "Use exact enum values from the specific collection's enum_queryables",
-                        "3": "Use the 'filter' parameter for all filtering",
+                        "2": "ALWAYS call fetch_detailed_collections() before search_features",
+                        "3": "Use exact enum values from the fetched enum_queryables",
                         "4": "Quote string values in single quotes",
                     },
                 }
@@ -308,12 +195,13 @@ class OSDataHubService(FeatureService):
             )
 
     def _require_workflow_context(self, func):
-        """Middleware to ensure workflow context is provided before any tool execution"""
+        # Functions that don't need workflow context
+        skip_functions = {"get_workflow_context", "hello_world", "check_api_key"}
 
         @functools.wraps(func)
         async def wrapper(*args, **kwargs):
             if self.workflow_planner is None:
-                if func.__name__ == "get_workflow_context":
+                if func.__name__ in skip_functions:
                     return await func(*args, **kwargs)
                 else:
                     return json.dumps(
@@ -335,11 +223,12 @@ class OSDataHubService(FeatureService):
         if "error" in response_data:
             response_data["retry_guidance"] = {
                 "tool": tool_name,
-                "suggestion": "Review the error message and try again with corrected parameters",
-                "MANDATORY_INSTRUCTION": "YOU MUST call get_workflow_context() if you need to see available options again",
+                "MANDATORY_INSTRUCTION 1": "Review the error message and try again with corrected parameters",
+                "MANDATORY_INSTRUCTION 2": "YOU MUST call get_workflow_context() if you need to see available options again",
             }
         return response_data
 
+    # All the tools
     async def hello_world(self, name: str) -> str:
         """Simple hello world tool for testing"""
         return f"Hello, {name}! 👋"
@@ -379,7 +268,7 @@ class OSDataHubService(FeatureService):
                 self._add_retry_context(error_response, "list_collections")
             )
 
-    async def get_collection_info(
+    async def get_single_collection(
         self,
         collection_id: str,
     ) -> str:
@@ -404,7 +293,7 @@ class OSDataHubService(FeatureService):
                 self._add_retry_context(error_response, "get_collection_info")
             )
 
-    async def get_collection_queryables(
+    async def get_single_collection_queryables(
         self,
         collection_id: str,
     ) -> str:
@@ -438,69 +327,129 @@ class OSDataHubService(FeatureService):
         offset: int = 0,
         filter: Optional[str] = None,
         filter_lang: Optional[str] = "cql-text",
-        # Keep legacy parameters for backward compatibility
-        # TODO: Remove these parameters in future?
         query_attr: Optional[str] = None,
         query_attr_value: Optional[str] = None,
     ) -> str:
-        """
-        Search for features in a collection with full CQL2 filter support.
-
-        Args:
-            collection_id: The collection ID to search in
-            bbox: Bounding box as "min_lon,min_lat,max_lon,max_lat"
-            crs: Coordinate reference system for the response
-            limit: Maximum number of features to return (default: 10)
-            offset: Number of features to skip (default: 0)
-            filter: CQL2 filter expression (e.g., "oslandusetiera = 'Cinema'" or "roadclassification = 'A Road'")
-            filter_lang: Filter language, defaults to "cql-text"
-            query_attr: [DEPRECATED] Legacy simple attribute name for filtering
-            query_attr_value: [DEPRECATED] Legacy simple attribute value for filtering
-
-        Returns:
-            JSON string with feature collection data
-
-        Examples:
-            # Using enum values from workflow context
-            search_features("lus-fts-site-1", bbox="...", filter="oslandusetiera = 'Cinema'")
-            search_features("trn-ntwk-street-1", bbox="...", filter="roadclassification = 'A Road'")
-
-            # Complex filters
-            search_features("trn-ntwk-street-1", filter="roadclassification = 'A Road' AND operationalstate = 'Open'")
-
-            # Text matching
-            search_features("trn-ntwk-street-1", filter="designatedname1_text LIKE '%high%'")
-        """
+        """Search for features in a collection with full CQL2 filter support."""
         try:
             params: Dict[str, Union[str, int]] = {}
 
             if limit:
-                params["limit"] = limit
+                params["limit"] = min(limit, 100)
             if offset:
-                params["offset"] = offset
-
+                params["offset"] = max(0, offset)
             if bbox:
                 params["bbox"] = bbox
             if crs:
                 params["crs"] = crs
-
-            # Handle CQL filter (preferred method)
             if filter:
-                params["filter"] = filter
+                if len(filter) > 1000:
+                    raise ValueError("Filter too long")
+                dangerous_patterns = [
+                    r";\s*--",
+                    r";\s*/\*",
+                    r"\bUNION\b",
+                    r"\bSELECT\b",
+                    r"\bINSERT\b",
+                    r"\bUPDATE\b",
+                    r"\bDELETE\b",
+                    r"\bDROP\b",
+                    r"\bCREATE\b",
+                    r"\bALTER\b",
+                    r"\bTRUNCATE\b",
+                    r"\bEXEC\b",
+                    r"\bEXECUTE\b",
+                    r"\bSP_\b",
+                    r"\bXP_\b",
+                    r"<script\b",
+                    r"javascript:",
+                    r"vbscript:",
+                    r"onload\s*=",
+                    r"onerror\s*=",
+                    r"onclick\s*=",
+                    r"\beval\s*\(",
+                    r"document\.",
+                    r"window\.",
+                    r"location\.",
+                    r"cookie",
+                    r"innerHTML",
+                    r"outerHTML",
+                    r"alert\s*\(",
+                    r"confirm\s*\(",
+                    r"prompt\s*\(",
+                    r"setTimeout\s*\(",
+                    r"setInterval\s*\(",
+                    r"Function\s*\(",
+                    r"constructor",
+                    r"prototype",
+                    r"__proto__",
+                    r"process\.",
+                    r"require\s*\(",
+                    r"import\s+",
+                    r"from\s+.*import",
+                    r"\.\./",
+                    r"file://",
+                    r"ftp://",
+                    r"data:",
+                    r"blob:",
+                    r"\\x[0-9a-fA-F]{2}",
+                    r"%[0-9a-fA-F]{2}",
+                    r"&#x[0-9a-fA-F]+;",
+                    r"&[a-zA-Z]+;",
+                    r"\$\{",
+                    r"#\{",
+                    r"<%",
+                    r"%>",
+                    r"{{",
+                    r"}}",
+                    r"\\\w+",
+                    r"\0",
+                    r"\r\n",
+                    r"\n\r",
+                ]
+
+                for pattern in dangerous_patterns:
+                    if re.search(pattern, filter, re.IGNORECASE):
+                        raise ValueError("Invalid filter content")
+
+                if filter.count("'") % 2 != 0:
+                    raise ValueError("Unmatched quotes in filter")
+
+                params["filter"] = filter.strip()
                 if filter_lang:
                     params["filter-lang"] = filter_lang
-            # Legacy support for simple query_attr/query_attr_value
-            # TODO: Remove these parameters in future?
+
             elif query_attr and query_attr_value:
-                params["filter"] = f"{query_attr} = '{query_attr_value}'"
+                if not re.match(r"^[a-zA-Z_][a-zA-Z0-9_]*$", query_attr):
+                    raise ValueError("Invalid field name")
+
+                escaped_value = str(query_attr_value).replace("'", "''")
+                params["filter"] = f"{query_attr} = '{escaped_value}'"
                 if filter_lang:
                     params["filter-lang"] = filter_lang
+
+            if self.workflow_planner:
+                valid_collections = set(
+                    self.workflow_planner.basic_collections_info.keys()
+                )
+                if collection_id not in valid_collections:
+                    return json.dumps(
+                        {
+                            "error": f"Invalid collection '{collection_id}'. Valid collections: {sorted(valid_collections)[:10]}...",
+                            "suggestion": "Call get_workflow_context() to see all available collections",
+                        }
+                    )
 
             data = await self.api_client.make_request(
                 "COLLECTION_FEATURES", params=params, path_params=[collection_id]
             )
 
             return json.dumps(data)
+        except ValueError as ve:
+            error_response = {"error": f"Invalid input: {str(ve)}"}
+            return json.dumps(
+                self._add_retry_context(error_response, "search_features")
+            )
         except Exception as e:
             error_response = {"error": str(e)}
             return json.dumps(
@@ -672,3 +621,91 @@ class OSDataHubService(FeatureService):
             return json.dumps({category: PROMPT_TEMPLATES[category]})
 
         return json.dumps(PROMPT_TEMPLATES)
+
+    async def fetch_detailed_collections(self, collection_ids: str) -> str:
+        """
+        Fetch detailed queryables for specific collections mentioned in LLM workflow plan.
+
+        This is mainly to reduce the size of the context for the LLM.
+
+        Only fetch what you really need.
+
+        Args:
+            collection_ids: Comma-separated list of collection IDs (e.g., "lus-fts-site-1,trn-ntwk-street-1")
+
+        Returns:
+            JSON string with detailed queryables for the specified collections
+        """
+        try:
+            if not self.workflow_planner:
+                return json.dumps(
+                    {
+                        "error": "Workflow planner not initialized. Call get_workflow_context() first."
+                    }
+                )
+
+            requested_collections = [cid.strip() for cid in collection_ids.split(",")]
+
+            valid_collections = set(self.workflow_planner.basic_collections_info.keys())
+            invalid_collections = [
+                cid for cid in requested_collections if cid not in valid_collections
+            ]
+
+            if invalid_collections:
+                return json.dumps(
+                    {
+                        "error": f"Invalid collection IDs: {invalid_collections}",
+                        "valid_collections": sorted(valid_collections),
+                    }
+                )
+
+            cached_collections = [
+                cid
+                for cid in requested_collections
+                if cid in self.workflow_planner.detailed_collections_cache
+            ]
+
+            collections_to_fetch = [
+                cid
+                for cid in requested_collections
+                if cid not in self.workflow_planner.detailed_collections_cache
+            ]
+
+            if collections_to_fetch:
+                logger.info(f"Fetching detailed queryables for: {collections_to_fetch}")
+                detailed_queryables = (
+                    await self.api_client.fetch_collections_queryables(
+                        collections_to_fetch
+                    )
+                )
+
+                for coll_id, queryables in detailed_queryables.items():
+                    self.workflow_planner.detailed_collections_cache[coll_id] = {
+                        "id": queryables.id,
+                        "title": queryables.title,
+                        "description": queryables.description,
+                        "all_queryables": queryables.all_queryables,
+                        "enum_queryables": queryables.enum_queryables,
+                        "has_enum_filters": queryables.has_enum_filters,
+                        "total_queryables": queryables.total_queryables,
+                        "enum_count": queryables.enum_count,
+                    }
+
+            context = self.workflow_planner.get_detailed_context(requested_collections)
+
+            return json.dumps(
+                {
+                    "success": True,
+                    "collections_processed": requested_collections,
+                    "collections_fetched_from_api": collections_to_fetch,
+                    "collections_from_cache": cached_collections,
+                    "detailed_collections": context["available_collections"],
+                    "message": f"Detailed queryables now available for: {', '.join(requested_collections)}",
+                }
+            )
+
+        except Exception as e:
+            logger.error(f"Error fetching detailed collections: {e}")
+            return json.dumps(
+                {"error": str(e), "suggestion": "Check collection IDs and try again"}
+            )
