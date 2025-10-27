@@ -4,9 +4,9 @@ A MCP server for accessing UK geospatial data through Ordnance Survey APIs.
 
 ## What it does
 
-Query the OS Data Hub and return the results to the user.
+Provides LLM access to the Ordnance Survey's Data Hub APIs.
 
-Ask questions such as find me all cinemas in Leeds City Centre and it will return the results.
+Ask simple questions such as find me all cinemas in Leeds City Centre or use the prompts templates for more complex, speciifc use cases - relating to street works, planning, etc.
 
 Use the prompts templates for more complex, speciifc use cases - relating to road networks, etc.
 
