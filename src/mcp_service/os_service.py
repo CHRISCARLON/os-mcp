@@ -94,7 +94,72 @@ class OSDataHubService(FeatureService):
         workflow_prompts = OSWorkflowPrompts(self.mcp)
         workflow_prompts.register_all()
 
-    # Run the MCP service
+    def _strip_verbose(self, data: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Remove geometry and other verbose fields from features to reduce response size.
+
+        Args:
+            data: GeoJSON FeatureCollection response
+
+        Returns:
+            Same data structure with verbose fields removed
+        """
+        if "features" in data:
+            for feature in data["features"]:
+                if "geometry" in feature:
+                    if feature["geometry"]:
+                        feature["geometry"] = {
+                            "type": feature["geometry"].get("type", "unknown"),
+                            "_stripped": True,
+                            "_note": "Geometry removed to reduce context size"
+                        }
+
+                if "properties" in feature and isinstance(feature["properties"], dict):
+                    if "sitetoaddressreference" in feature["properties"]:
+                        ref_count = len(feature["properties"]["sitetoaddressreference"]) if isinstance(feature["properties"]["sitetoaddressreference"], list) else 1
+                        feature["properties"]["sitetoaddressreference"] = {
+                            "_stripped": True,
+                            "_count": ref_count,
+                            "_note": "Site to address references removed to reduce context size"
+                        }
+        return data
+
+    def _summarise_features(self, data: Dict[str, Any], max_features: int = 5) -> Dict[str, Any]:
+        """
+        Summarise feature collection to reduce context size.
+
+        Args:
+            data: GeoJSON FeatureCollection response
+            max_features: Maximum number of full features to include
+
+        Returns:
+            Summarised response with counts and sample features
+        """
+        if "features" not in data:
+            return data
+
+        features = data["features"]
+        total_count = len(features)
+
+        if total_count <= max_features:
+            return data
+
+        summary = {
+            "type": data.get("type", "FeatureCollection"),
+            "summary": {
+                "total_features": total_count,
+                "showing_samples": max_features,
+                "note": f"Showing {max_features} of {total_count} features to reduce context size. Use offset/limit for pagination."
+            },
+            "features": features[:max_features],
+            "links": data.get("links", []),
+            "numberMatched": data.get("numberMatched"),
+            "numberReturned": max_features,
+            "_original_numberReturned": data.get("numberReturned"),
+        }
+
+        return summary
+
     def run(self) -> None:
         """Run the MCP service"""
         try:
@@ -332,8 +397,30 @@ class OSDataHubService(FeatureService):
         filter_lang: Optional[str] = "cql-text",
         query_attr: Optional[str] = None,
         query_attr_value: Optional[str] = None,
+        exclude_geometry: bool = True,
+        summarize: bool = False,
+        max_features_in_summary: int = 5,
     ) -> str:
-        """Search for features in a collection with full CQL2 filter support."""
+        """
+        Search for features in a collection with full CQL2 filter support.
+
+        Args:
+            collection_id: The collection to search
+            bbox: Bounding box filter
+            crs: Coordinate reference system
+            limit: Max features to return from API (default: 10, max: 100)
+            offset: Offset for pagination
+            filter: CQL2 filter expression
+            filter_lang: Filter language (default: cql-text)
+            query_attr: Simple attribute query field name
+            query_attr_value: Simple attribute query value
+            exclude_geometry: Strip geometry to reduce context size (default: True)
+            summarize: Return summary with sample features instead of all (default: False)
+            max_features_in_summary: Max features to show if summarizing (default: 5)
+
+        Returns:
+            JSON string with features or summary
+        """
         try:
             params: Dict[str, Union[str, int]] = {}
 
@@ -446,6 +533,15 @@ class OSDataHubService(FeatureService):
             data = await self.api_client.make_request(
                 "COLLECTION_FEATURES", params=params, path_params=[collection_id]
             )
+
+            # Apply response optimizations to reduce context size
+            if exclude_geometry:
+                data = self._strip_verbose(data)
+                logger.debug(f"Stripped geometry from {len(data.get('features', []))} features")
+
+            if summarize:
+                data = self._summarise_features(data, max_features_in_summary)
+                logger.debug(f"Summarized response to {max_features_in_summary} features")
 
             return json.dumps(data)
         except ValueError as ve:
@@ -615,7 +711,7 @@ class OSDataHubService(FeatureService):
 
         Args:
             category: Optional category of templates to return
-                     (general, collections, features, linked_identifiers)
+                    (general, collections, features, linked_identifiers)
 
         Returns:
             JSON string containing prompt templates
@@ -720,21 +816,24 @@ class OSDataHubService(FeatureService):
         include_nodes: bool = True,
         include_edges: bool = True,
         build_network: bool = True,
+        exclude_geometry: bool = True,
     ) -> str:
         """
         Get routing data - builds network and returns nodes/edges as flat tables.
 
         Args:
             bbox: Optional bounding box (format: "minx,miny,maxx,maxy")
-            limit: Maximum number of road links to process (default: 1000)
+            limit: Maximum number of road links to process (default: 100)
             include_nodes: Whether to include nodes in response (default: True)
             include_edges: Whether to include edges in response (default: True)
             build_network: Whether to build network first (default: True)
+            exclude_geometry: Strip geometry to reduce context size (default: True)
 
         Returns:
             JSON string with routing network data
         """
         try:
+
             result = {}
 
             if build_network:
@@ -752,7 +851,20 @@ class OSDataHubService(FeatureService):
 
             if include_edges:
                 edges_result = self.routing_service.get_flat_edges()
-                result["edges"] = edges_result.get("edges", [])
+                edges = edges_result.get("edges", [])
+
+                # Strip geometry from edges to reduce context size
+                if exclude_geometry and edges:
+                    for edge in edges:
+                        if "geometry" in edge and edge["geometry"]:
+                            edge["geometry"] = {
+                                "type": edge["geometry"].get("type", "unknown"),
+                                "_stripped": True,
+                                "_note": "Geometry removed to reduce context size"
+                            }
+                    logger.debug(f"Stripped geometry from {len(edges)} routing edges")
+
+                result["edges"] = edges
 
             summary = self.routing_service.get_network_info()
             result["summary"] = summary.get("network", {})

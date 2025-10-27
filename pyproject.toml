@@ -1,14 +1,14 @@
 [project]
 name = "os-mcp"
-version = "0.1.5"
+version = "0.1.6"
 description = "A Python MCP server that provides access to Ordnance Survey's DataHub APIs."
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
-    "aiohttp>=3.11.18",
-    "anthropic>=0.51.0",
-    "fastapi>=0.116.1",
-    "mcp>=1.12.0",
-    "starlette>=0.47.1",
-    "uvicorn>=0.35.0",
+    "aiohttp>=3.13.0",
+    "anthropic>=0.71.0",
+    "fastapi>=0.120.0",
+    "mcp>=1.19.0",
+    "starlette>=0.48.0",
+    "uvicorn>=0.38.0",
 ]

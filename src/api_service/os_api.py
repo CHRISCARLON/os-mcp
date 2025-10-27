@@ -24,18 +24,22 @@ class OSAPIClient(APIClient):
 
     user_agent = "os-ngd-mcp-server/1.0"
 
-    def __init__(self, api_key: Optional[str] = None):
+    def __init__(self, api_key: Optional[str] = None, max_concurrent_requests: int = 5):
         """
         Initialise the OS API client
 
         Args:
             api_key: Optional API key, if not provided will use OS_API_KEY env var
+            max_concurrent_requests: Maximum number of concurrent requests (default: 5)
         """
         self.api_key = api_key
         self.session = None
         self.last_request_time = 0
-        # TODO: This is because there seems to be some rate limiting in place - TBC if this is the case
-        self.request_delay = 0.7
+
+        # Configurable rate limiting - reduced from 0.7s to 0.3s for better performance
+        # Can be adjusted based on API quota
+        self.request_delay = float(os.environ.get("OS_API_RATE_LIMIT", "0.3"))
+        self._request_semaphore = asyncio.Semaphore(max_concurrent_requests)
         self._cached_openapi_spec: Optional[OpenAPISpecification] = None
         self._cached_collections: Optional[CollectionsCache] = None
 
@@ -394,14 +398,16 @@ class OSAPIClient(APIClient):
 
         return {coll_id: queryables for coll_id, queryables in processed}
 
-    # Public async methods
     async def initialise(self):
         """Initialise the aiohttp session if not already created"""
         if self.session is None:
             self.session = aiohttp.ClientSession(
                 connector=aiohttp.TCPConnector(
-                    force_close=True,
-                    limit=1,  # TODO: Strict limit to only 1 connection - may need to revisit this
+                    limit=10,  
+                    limit_per_host=5,  
+                    ttl_dns_cache=300,  
+                    force_close=False,  
+                    enable_cleanup_closed=True,  
                 )
             )
 
@@ -447,70 +453,71 @@ class OSAPIClient(APIClient):
         if self.session is None:
             raise ValueError("Session not initialised")
 
-        current_time = asyncio.get_event_loop().time()
-        elapsed = current_time - self.last_request_time
-        if elapsed < self.request_delay:
-            await asyncio.sleep(self.request_delay - elapsed)
+        async with self._request_semaphore:
+            current_time = asyncio.get_event_loop().time()
+            elapsed = current_time - self.last_request_time
+            if elapsed < self.request_delay:
+                await asyncio.sleep(self.request_delay - elapsed)
 
-        try:
-            endpoint_value = NGDAPIEndpoint[endpoint].value
-        except KeyError:
-            raise ValueError(f"Invalid endpoint: {endpoint}")
-
-        if path_params:
-            endpoint_value = endpoint_value.format(*path_params)
-
-        api_key = await self.get_api_key()
-        request_params = params or {}
-        request_params["key"] = api_key
-
-        headers = {"User-Agent": self.user_agent, "Accept": "application/json"}
-
-        client_ip = getattr(self.session, "_source_address", None)
-        client_info = f" from {client_ip}" if client_ip else ""
-
-        sanitized_url = self._sanitise_api_key(endpoint_value)
-        logger.info(f"Requesting URL: {sanitized_url}{client_info}")
-
-        for attempt in range(1, max_retries + 1):
             try:
-                self.last_request_time = asyncio.get_event_loop().time()
+                endpoint_value = NGDAPIEndpoint[endpoint].value
+            except KeyError:
+                raise ValueError(f"Invalid endpoint: {endpoint}")
 
-                timeout = aiohttp.ClientTimeout(total=30.0)
-                async with self.session.get(
-                    endpoint_value,
-                    params=request_params,
-                    headers=headers,
-                    timeout=timeout,
-                ) as response:
-                    if response.status >= 400:
-                        error_text = await response.text()
-                        sanitized_error = self._sanitise_api_key(error_text)
-                        error_message = (
-                            f"HTTP Error: {response.status} - {sanitized_error}"
-                        )
+            if path_params:
+                endpoint_value = endpoint_value.format(*path_params)
+
+            api_key = await self.get_api_key()
+            request_params = params or {}
+            request_params["key"] = api_key
+
+            headers = {"User-Agent": self.user_agent, "Accept": "application/json"}
+
+            client_ip = getattr(self.session, "_source_address", None)
+            client_info = f" from {client_ip}" if client_ip else ""
+
+            sanitized_url = self._sanitise_api_key(endpoint_value)
+            logger.info(f"Requesting URL: {sanitized_url}{client_info}")
+
+            for attempt in range(1, max_retries + 1):
+                try:
+                    self.last_request_time = asyncio.get_event_loop().time()
+
+                    timeout = aiohttp.ClientTimeout(total=30.0)
+                    async with self.session.get(
+                        endpoint_value,
+                        params=request_params,
+                        headers=headers,
+                        timeout=timeout,
+                    ) as response:
+                        if response.status >= 400:
+                            error_text = await response.text()
+                            sanitized_error = self._sanitise_api_key(error_text)
+                            error_message = (
+                                f"HTTP Error: {response.status} - {sanitized_error}"
+                            )
+                            logger.error(f"Error: {error_message}")
+                            raise ValueError(error_message)
+
+                        response_data = await response.json()
+
+                        return self._sanitise_response(response_data)
+                except (aiohttp.ClientError, asyncio.TimeoutError) as e:
+                    if attempt == max_retries:
+                        sanitized_exception = self._sanitise_api_key(str(e))
+                        error_message = f"Request failed after {max_retries} attempts: {sanitized_exception}"
                         logger.error(f"Error: {error_message}")
                         raise ValueError(error_message)
-
-                    response_data = await response.json()
-
-                    return self._sanitise_response(response_data)
-            except (aiohttp.ClientError, asyncio.TimeoutError) as e:
-                if attempt == max_retries:
+                    else:
+                        await asyncio.sleep(0.5 * attempt)
+                except Exception as e:
                     sanitized_exception = self._sanitise_api_key(str(e))
-                    error_message = f"Request failed after {max_retries} attempts: {sanitized_exception}"
+                    error_message = f"Request failed: {sanitized_exception}"
                     logger.error(f"Error: {error_message}")
                     raise ValueError(error_message)
-                else:
-                    await asyncio.sleep(0.7)
-            except Exception as e:
-                sanitized_exception = self._sanitise_api_key(str(e))
-                error_message = f"Request failed: {sanitized_exception}"
-                logger.error(f"Error: {error_message}")
-                raise ValueError(error_message)
-        raise RuntimeError(
-            "Unreachable: make_request exited retry loop without returning or raising"
-        )
+            raise RuntimeError(
+                "Unreachable: make_request exited retry loop without returning or raising"
+            )
 
     async def make_request_no_auth(
         self,

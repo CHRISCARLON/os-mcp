@@ -8,9 +8,9 @@ Query the OS Data Hub and return the results to the user.
 
 Ask questions such as find me all cinemas in Leeds City Centre and it will return the results.
 
-Use the prompts templates for more complex, speciifc use cases - relating to street works, planning, etc.
+Use the prompts templates for more complex, speciifc use cases - relating to road networks, etc.
 
-This MCP server enforces a 2 step workflow plan to ensure the user gets the best results.
+This MCP server enforces a 2 step workflow plan to ensure the user gets the best results - it must always produce a plan before making searches.
 
 ## Quick Start
 
@@ -55,24 +55,6 @@ Add the following to your Claude Desktop config:
 ```
 
 Open Claude Desktop and you show see all available tools, resources, and prompts.
-
-## How it works
-
-```
-1. Ask a question
-   ↓
-2. Server gets workflow context (collections + filtering options)
-   ↓
-3. Smart planning: "I'll search the 'lus-fts-site-1' collection
-   using filter 'oslandusetertiarygroup = \"Cinema\"'"
-   ↓
-4. Precise results using collection-specific enum values
-```
-
-## Requirements
-
-- Python 3.11+
-- OS API Key from [OS Data Hub](https://osdatahub.os.uk/)
 
 ## License
 

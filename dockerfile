@@ -1,4 +1,4 @@
-FROM python:3.11-slim
+FROM python:3.11.14-slim
 
 WORKDIR /app
 
@@ -7,16 +7,22 @@ ENV PYTHONPATH=/app/src \
     PIP_NO_CACHE_DIR=1 \
     PIP_DISABLE_PIP_VERSION_CHECK=1
 
-
 RUN apt-get update && apt-get install -y \
     gcc \
     && rm -rf /var/lib/apt/lists/* \
-    && apt-get clean
+    && apt-get clean \
+    && pip install --upgrade pip
 
-COPY pyproject.toml ./
+RUN groupadd -r appuser && \
+    useradd -r -g appuser -u 1000 appuser && \
+    chown -R appuser:appuser /app
+
+COPY --chown=appuser:appuser pyproject.toml ./
 RUN pip install --no-cache-dir .
 
-COPY src/ ./src/
+COPY --chown=appuser:appuser src/ ./src/
+
+USER appuser
 
 EXPOSE 8000
 
